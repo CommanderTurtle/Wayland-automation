@@ -17,8 +17,17 @@ class KeyboardTests(unittest.TestCase):
     def test_text_is_one_checked_process(self, run):
         Keyboard().typewrite("-- text λ", 0.02)
         self.assertEqual(run.call_args.args[0],
-                         ["wtype", "-d", "20", "--", "-- text λ"])
+                         ["wtype", "-d", "20", "-"])
         self.assertTrue(run.call_args.kwargs["check"])
+        self.assertEqual(run.call_args.kwargs["input"], "-- text λ")
+
+    @patch("wayland_automation.keyboard_controller.subprocess.run")
+    def test_zero_delay_and_super_alias(self, run):
+        Keyboard().typewrite("hello")
+        self.assertEqual(run.call_args.args[0], ["wtype", "-"])
+        Keyboard().hotkey("super", "altgr", "e")
+        self.assertEqual(run.call_args.args[0], ["wtype", "-M", "logo",
+                         "-M", "altgr", "-k", "e", "-m", "altgr", "-m", "logo"])
 
     @patch("wayland_automation.keyboard_controller.subprocess.run")
     def test_enter_is_named_key_not_duplicate_newline(self, run):

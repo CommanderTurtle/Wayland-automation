@@ -39,7 +39,8 @@ class Keyboard:
             "control": "ctrl",
             "alt": "alt",
             "shift": "shift",
-            "super": "super"
+            "super": "logo", "win": "logo", "logo": "logo",
+            "altgr": "altgr", "iso_level3_shift": "altgr"
         }
         # A mapping for some common keys to their special characters.
         self.key_map = {
@@ -55,9 +56,9 @@ class Keyboard:
             raise ValueError("A key name must be nonempty and contain no NUL")
         return self.modifier_map.get(key.lower(), self.key_map.get(key.lower(), key))
 
-    def _run(self, args, timeout=30):
+    def _run(self, args, timeout=30, input=None):
         result = subprocess.run(["wtype", *args], capture_output=True,
-                                text=True, timeout=timeout, check=True)
+                                text=True, timeout=timeout, check=True, input=input)
         return result
 
     def typewrite(self, text: str, interval: float = 0):
@@ -65,8 +66,9 @@ class Keyboard:
         if not math.isfinite(interval) or interval < 0:
             raise ValueError("interval must be finite and nonnegative")
         if text:
-            self._run(["-d", str(round(interval * 1000)), "--", text],
-                      timeout=max(30, len(text) * interval + 10))
+            delay = round(interval * 1000)
+            args = (["-d", str(delay)] if delay else []) + ["-"]
+            self._run(args, timeout=max(30, len(text) * interval + 10), input=text)
 
     def press(self, key: str):
         """Presses and releases a single key."""
