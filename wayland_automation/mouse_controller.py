@@ -29,6 +29,7 @@ import struct
 import sys
 import time
 from wayland_automation.utils.screen_resolution import get_resolution
+from wayland_automation.utils.screen_resolution import get_geometry
 
 # Configure logging
 import logging
@@ -39,6 +40,7 @@ logger = logging.getLogger(__name__)
 # Define button constants
 BUTTON_LEFT = 0x110
 BUTTON_RIGHT = 0x111
+BUTTON_MIDDLE = 0x112
 
 class WaylandProtocolError(Exception):
     """Exception raised when a required Wayland protocol is not available."""
@@ -97,10 +99,14 @@ class Mouse:
 
     def get_socket_path(self):
         wayland_display = os.getenv("WAYLAND_DISPLAY", "wayland-0")
-        return f"/run/user/{os.getuid()}/{wayland_display}"
+        if os.path.isabs(wayland_display):
+            return wayland_display
+        runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+        return os.path.join(runtime, wayland_display)
 
     def connect_to_wayland(self):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(5)
         sock.connect(self.socket_path)
         logger.info(f"Connected to Wayland server at {self.socket_path}")
         return sock
@@ -115,35 +121,48 @@ class Mouse:
         )
         try:
             self.sock.sendall(message)
-        except BrokenPipeError:
-            logger.error("SIGPIPE detected: Wayland connection closed unexpectedly.")
-            sys.exit(1)
+        except OSError as error:
+            raise WaylandConnectionError(f"Wayland connection lost: {error}") from error
 
     def send_registry_request(self):
         self.send_message(1, 1, struct.pack(f"{self.endianness}I", self.wl_registry_id))
         logger.debug("Sent wl_display.get_registry() request...")
 
     def send_sync_request(self):
+        # wl_callback is a one-shot object. Never reuse an id before delete_id.
+        self.callback_id = self.next_id
+        self.next_id += 1
         self.send_message(1, 0, struct.pack(f"{self.endianness}I", self.callback_id))
         logger.debug("Sent wl_display.sync() request...")
 
     def receive_message(self):
-        header = self.sock.recv(8)
-        if len(header) < 8:
-            return None, None, None
+        def read_exact(size):
+            data = bytearray()
+            while len(data) < size:
+                try:
+                    chunk = self.sock.recv(size - len(data))
+                except OSError as error:
+                    raise WaylandConnectionError(str(error)) from error
+                if not chunk:
+                    raise WaylandConnectionError("Wayland connection closed")
+                data.extend(chunk)
+            return bytes(data)
+        header = read_exact(8)
         object_id, size_opcode = struct.unpack(f"{self.endianness}II", header)
         size = (size_opcode >> 16) & 0xFFFF
         opcode = size_opcode & 0xFFFF
-        message_data = self.sock.recv(size - 8)
+        if size < 8 or size % 4:
+            raise WaylandProtocolError(f"Invalid Wayland message size: {size}")
+        message_data = read_exact(size - 8)
         return object_id, opcode, message_data
 
     def handle_events(self):
         # Set socket to non-blocking to drain all available messages
-        self.sock.setblocking(False)
+        self.sock.settimeout(5)
         callback_done = False
         
         try:
-            while True:
+            while not callback_done:
                 try:
                     result = self.receive_message()
                     if result is None or result[0] is None:
@@ -152,6 +171,8 @@ class Mouse:
 
                     if object_id == 1:
                         logger.debug(f"Received event from wl_display: {opcode}")
+                        if opcode == 0:
+                            raise WaylandProtocolError(f"Compositor rejected request: {message_data!r}")
 
                     if object_id == self.wl_registry_id and opcode == 0:
                         global_name = struct.unpack(f"{self.endianness}I", message_data[:4])[0]
@@ -174,7 +195,7 @@ class Mouse:
                                 + encode_wayland_string(interface_name)
                                 + struct.pack(
                                     f"{self.endianness}II",
-                                    version,
+                                    min(version, 2),
                                     self.virtual_pointer_manager_id,
                                 )
                             )
@@ -194,8 +215,7 @@ class Mouse:
                     time.sleep(0.001)
                     
         finally:
-            # Restore blocking mode
-            self.sock.setblocking(True)
+            self.sock.settimeout(5)
 
     def create_virtual_pointer(self):
         new_pointer_id = self.next_id
@@ -208,7 +228,10 @@ class Mouse:
         self.current_virtual_pointer_id = new_pointer_id
 
     def send_motion_absolute(self, x, y, x_extent, y_extent):
-        payload = struct.pack(f"{self.endianness}IIIII", 0, x, y, x_extent, y_extent)
+        if x_extent <= 0 or y_extent <= 0 or not (0 <= x <= x_extent and 0 <= y <= y_extent):
+            raise ValueError("Coordinates must be inside positive desktop extents")
+        stamp = int(time.monotonic() * 1000) & 0xffffffff
+        payload = struct.pack(f"{self.endianness}IIIII", stamp, x, y, x_extent, y_extent)
         self.send_message(self.current_virtual_pointer_id, 1, payload)
         # Send frame event after motion
         self.send_message(self.current_virtual_pointer_id, 4, b'')
@@ -228,12 +251,24 @@ class Mouse:
         )
         self.send_message(self.current_virtual_pointer_id, 4, b'')  # Frame after release
 
+    def button(self, button, pressed):
+        """Set a button state on this persistent pointer (numeric evdev code or name)."""
+        names = {"left": BUTTON_LEFT, "right": BUTTON_RIGHT, "middle": BUTTON_MIDDLE}
+        code = names.get(button, button) if isinstance(button, str) else button
+        if not isinstance(code, int) or not 0x110 <= code <= 0x117:
+            raise ValueError("Invalid pointer button")
+        self.send_message(self.current_virtual_pointer_id, 2,
+                          struct.pack(f"{self.endianness}III",
+                                      int(time.monotonic() * 1000) & 0xffffffff,
+                                      code, int(bool(pressed))))
+        self.send_message(self.current_virtual_pointer_id, 4, b"")
+
     def click(self, x, y, button=None):
         """
         Moves the pointer to (x, y) and, if button is specified, performs a click.
         """
-        height, width = get_resolution()
-        self.send_motion_absolute(x, y, int(height), int(width))
+        origin_x, origin_y, width, height = get_geometry()
+        self.send_motion_absolute(x - origin_x, y - origin_y, width, height)
         
         if button is not None:
             if isinstance(button, str):
@@ -242,11 +277,12 @@ class Mouse:
                     button_code = BUTTON_LEFT
                 elif btn == "right":
                     button_code = BUTTON_RIGHT
+                elif btn == "middle":
+                    button_code = BUTTON_MIDDLE
                 elif btn == "nothing":
                     return
                 else:
-                    print("Invalid button string. Use 'left', 'right', or 'nothing'.")
-                    return
+                    raise ValueError("Use left, middle, right, or nothing")
             else:
                 button_code = int(button)
             self.send_click(button_code)
@@ -265,13 +301,17 @@ class Mouse:
         try:
             duration = float(speed) if not isinstance(speed, str) or speed.lower() != "normal" else 1.0
         except ValueError:
-            print("Invalid speed value. Using default speed of 1.0 second.")
-            duration = 1.0
+            raise ValueError("speed must be a nonnegative finite duration")
+        import math
+        if not math.isfinite(duration) or duration < 0:
+            raise ValueError("speed must be a nonnegative finite duration")
 
-        height, width = get_resolution()
+        origin_x, origin_y, width, height = get_geometry()
+        start_x, end_x = start_x - origin_x, end_x - origin_x
+        start_y, end_y = start_y - origin_y, end_y - origin_y
 
         # Move pointer to start position
-        self.send_motion_absolute(start_x, start_y, int(height), int(width))
+        self.send_motion_absolute(start_x, start_y, width, height)
         # Send press (simulate left button down)
         self.send_message(
             self.current_virtual_pointer_id, 
@@ -287,7 +327,7 @@ class Mouse:
         for i in range(1, steps + 1):
             x = int(start_x + (end_x - start_x) * i / steps)
             y = int(start_y + (end_y - start_y) * i / steps)
-            self.send_motion_absolute(x, y, int(height), int(width))
+            self.send_motion_absolute(x, y, width, height)
             time.sleep(step_duration)
 
         # Send release (simulate left button up)
@@ -299,6 +339,41 @@ class Mouse:
         self.send_message(self.current_virtual_pointer_id, 4, b'')  # Frame after release
         self.send_sync_request()
         self.handle_events()
+
+    def scroll(self, vertical=0, horizontal=0):
+        """Scroll signed wheel steps (positive = down/right), then synchronize."""
+        self.send_message(self.current_virtual_pointer_id, 5,
+                          struct.pack(f"{self.endianness}I", 0))
+        for axis, steps in ((0, vertical), (1, horizontal)):
+            if not isinstance(steps, int):
+                raise ValueError("Scroll steps must be integers")
+            if steps:
+                self.send_message(self.current_virtual_pointer_id, 7,
+                                  struct.pack(f"{self.endianness}IIii",
+                                              int(time.monotonic() * 1000) & 0xffffffff,
+                                              axis, steps * 15 * 256, steps))
+        self.send_message(self.current_virtual_pointer_id, 4, b"")
+        self.send_sync_request()
+        self.handle_events()
+
+    def close(self):
+        """Release this virtual input device and its socket. Safe to call twice."""
+        if self.sock is not None:
+            try:
+                if self.current_virtual_pointer_id is not None:
+                    self.send_message(self.current_virtual_pointer_id, 8, b"")
+            except WaylandConnectionError:
+                pass  # A disconnected compositor already released the device.
+            finally:
+                self.sock.close()
+                self.sock = None
+                self.current_virtual_pointer_id = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
     def auto_click(self, initial_delay=3.0, interval=0.1, duration=10.0, button="left"):
         """

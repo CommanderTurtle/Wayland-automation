@@ -10,9 +10,8 @@ setup(
     author_email="rtweber2004@gmail.com",
     url="https://github.com/OTAKUWeBer/Wayland-automation",
     packages=find_packages(),
-    install_requires=[
-        "evdev",
-    ],
+    install_requires=[],
+    extras_require={"evdev": ["evdev"]},
     classifiers=[
         "Programming Language :: Python :: 3",
         "Operating System :: POSIX :: Linux",

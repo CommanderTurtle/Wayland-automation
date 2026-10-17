@@ -18,6 +18,7 @@ Requires ``wtype`` to be installed (see README for install instructions).
 
 import subprocess
 import time
+import math
 
 class Keyboard:
     """
@@ -42,42 +43,76 @@ class Keyboard:
         }
         # A mapping for some common keys to their special characters.
         self.key_map = {
-            "enter": "\n",
-            "backspace": "\b",
-            "tab": "\t",
-            "space": " "
+            "enter": "Return", "return": "Return",
+            "backspace": "BackSpace", "tab": "Tab", "space": "space",
+            "esc": "Escape", "escape": "Escape", "delete": "Delete",
+            "left": "Left", "right": "Right", "up": "Up", "down": "Down"
         }
+
+    def _key(self, key):
+        key = str(key)
+        if not key or "\x00" in key:
+            raise ValueError("A key name must be nonempty and contain no NUL")
+        return self.modifier_map.get(key.lower(), self.key_map.get(key.lower(), key))
+
+    def _run(self, args, timeout=30):
+        result = subprocess.run(["wtype", *args], capture_output=True,
+                                text=True, timeout=timeout, check=True)
+        return result
 
     def typewrite(self, text: str, interval: float = 0):
         """Types the given text with an optional interval between characters."""
-        for char in text:
-            subprocess.run(["wtype", "--", char])
-            time.sleep(interval)
+        if not math.isfinite(interval) or interval < 0:
+            raise ValueError("interval must be finite and nonnegative")
+        if text:
+            self._run(["-d", str(round(interval * 1000)), "--", text],
+                      timeout=max(30, len(text) * interval + 10))
 
     def press(self, key: str):
         """Presses and releases a single key."""
-        self.keyDown(key)
-        self.keyUp(key)
+        self._run(["-k", self._key(key)])
 
     def keyDown(self, key: str):
-        """Simulates holding a key down."""
-        lower_key = key.lower()
-        if lower_key in self.key_map:
-            subprocess.run(["wtype", self.key_map[lower_key]])
-        elif lower_key in self.modifier_map:
-            # For modifiers, use -M (key down)
-            subprocess.run(["wtype", "-M", self.modifier_map[lower_key]])
-        else:
-            # For other keys, assume regular key press down.
-            subprocess.run(["wtype", "-k", lower_key])
+        """Press a key in one wtype invocation.
+
+        wtype releases keys when its process exits. For holds spanning several
+        events use sequence(), rather than separate keyDown()/keyUp() calls.
+        """
+        flag = "-M" if key.lower() in self.modifier_map else "-P"
+        self._run([flag, self._key(key)])
 
     def keyUp(self, key: str):
         """Simulates releasing a held key."""
-        lower_key = key.lower()
-        if lower_key in self.modifier_map:
-            # For modifiers, use -m (key up)
-            subprocess.run(["wtype", "-m", self.modifier_map[lower_key]])
-        # For non-modifiers, typically no separate release command is needed.
+        flag = "-m" if key.lower() in self.modifier_map else "-p"
+        self._run([flag, self._key(key)])
+
+    def sequence(self, events):
+        """Run (absolute milliseconds, 'down'|'up', key) events in one keyboard.
+
+        Times must be nonnegative and ordered. Any keys still held at the end
+        are released. Errors from wtype propagate instead of looking successful.
+        """
+        args, held, previous = [], [], 0
+        for timestamp, state, key in events:
+            if (not isinstance(timestamp, int) or timestamp < previous
+                    or state not in ("down", "up")):
+                raise ValueError("Events need ordered integer times and down/up states")
+            if timestamp > previous:
+                args.extend(["-s", str(timestamp - previous)])
+            previous = timestamp
+            name = self._key(key)
+            modifier = str(key).lower() in self.modifier_map
+            args.extend([("-M" if modifier else "-P") if state == "down"
+                         else ("-m" if modifier else "-p"), name])
+            entry = (name, modifier)
+            if state == "down" and entry not in held:
+                held.append(entry)
+            elif state == "up" and entry in held:
+                held.remove(entry)
+        for name, modifier in reversed(held):
+            args.extend(["-m" if modifier else "-p", name])
+        if args:
+            self._run(args, timeout=max(30, previous / 1000 + 10))
 
     def hotkey(self, *keys):
         """
@@ -95,7 +130,7 @@ class Keyboard:
             if key.lower() in self.modifier_map:
                 modifiers.append(self.modifier_map[key.lower()])
             else:
-                non_modifiers.append(key.lower())
+                non_modifiers.append(self._key(key))
 
         # Build the command list in one go.
         cmd = ["wtype"]
@@ -109,7 +144,8 @@ class Keyboard:
         for mod in reversed(modifiers):
             cmd.extend(["-m", mod])
 
-        subprocess.run(cmd)
+        if keys:
+            self._run(cmd[1:])
 
 # Example Usage
 if __name__ == "__main__":

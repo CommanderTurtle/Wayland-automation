@@ -221,6 +221,21 @@ wayland_automation/
 
 Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
+## Timed input and cleanup
+
+`Keyboard.sequence([(0, "down", "ctrl"), (0, "down", "c"), (100, "up", "c"), (100, "up", "ctrl")])`
+runs the complete sequence in one `wtype` process. Separate `keyDown`/`keyUp`
+calls cannot retain a held key across process exits. Keyboard subprocess failures
+are raised to the caller. `Mouse` can be used as a context manager to release its
+virtual pointer deterministically. `mouse.scroll(vertical=1, horizontal=0)` scrolls
+one step downward; negative steps scroll upward/leftward. Run the device-free
+regressions with `python -m unittest discover -s tests`.
+
+`Mouse.button("left", True)` and `Mouse.button("left", False)` hold/release a
+button on the same pointer, allowing multi-segment drags. The optional evdev
+tracking fallback is available through `pip install 'wayland-automation[evdev]'`;
+Hyprland tracking does not require input-group access.
+
 ## License
 
 [MIT License](LICENCE)
