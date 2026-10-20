@@ -71,7 +71,7 @@ class Mouse:
         self.wl_registry_id = 2
         self.callback_id = 3
         self.virtual_pointer_manager_id = 4
-        self.next_id = 5  # Start assigning new IDs from here
+        self.next_id = 3  # Wayland requires strictly sequential object IDs
         self.current_virtual_pointer_id = None
         
         self.protocols_found = []
@@ -202,6 +202,7 @@ class Mouse:
                             self.send_message(self.wl_registry_id, 0, payload)
                             self.virtual_pointer_manager_bound = True
                             logger.info("Bound to zwlr_virtual_pointer_manager_v1")
+                            self.next_id = max(self.next_id, self.virtual_pointer_manager_id + 1)
 
                     elif object_id == self.callback_id and opcode == 0:
                         logger.debug("Received wl_callback.done event.")
