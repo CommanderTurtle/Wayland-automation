@@ -43,13 +43,16 @@ def auto_click(initial_delay=3.0, interval=0.1, duration=10.0, button="left"):
         mouse.auto_click(initial_delay, interval, duration, button)
 
 def typewrite(text, interval=0):
-    Keyboard().typewrite(text, interval)
+    with Keyboard() as keyboard:
+        keyboard.typewrite(text, interval)
 
 def press(key):
-    Keyboard().press(key)
+    with Keyboard() as keyboard:
+        keyboard.press(key)
 
 def hotkey(*keys):
-    Keyboard().hotkey(*keys)
+    with Keyboard() as keyboard:
+        keyboard.hotkey(*keys)
 
 def scroll(vertical=0, horizontal=0):
     """Scroll wheel steps, positive down/right, without retaining a connection."""

@@ -29,7 +29,8 @@ pip install wayland-automation
 
 | Dependency | What it does | Install command |
 |---|---|---|
-| `wtype` | **Required** — keyboard automation | `sudo pacman -S wtype` (Arch) / `sudo apt install wtype` (Debian) / `sudo dnf install wtype` (Fedora) |
+| `libxkbcommon` | Physical keyboard codes and the existing seat layout | `sudo pacman -S libxkbcommon` (Arch) / `sudo apt install libxkbcommon0` (Debian) / `sudo dnf install libxkbcommon` (Fedora) |
+| `wtype` | Unicode text fallback for characters absent from the active layout | `sudo pacman -S wtype` (Arch) / `sudo apt install wtype` (Debian) / `sudo dnf install wtype` (Fedora) |
 | `wayland-utils` | Screen resolution detection | `sudo pacman -S wayland-utils` (Arch) / `sudo apt install wayland-utils` (Debian) / `sudo dnf install wayland-utils` (Fedora) |
 
 #### Mouse-tracking backends (pick the one for your compositor)
@@ -106,7 +107,40 @@ kb.press("enter")
 kb.hotkey("ctrl", "a")              # select all
 kb.keyDown("shift")                 # hold shift
 kb.keyUp("shift")                   # release shift
+kb.close()                          # also releases any remaining owned holds
 ```
+
+Named keys and timed sequences use `zwp_virtual_keyboard_manager_v1` with the
+seat's existing XKB keymap and matching physical evdev codes. Print is code 99,
+not wtype's private code 1 (which physical-key observers and normal Hyprland
+shortcut matching interpret as Escape). Modifiers emit actual key edges as well
+as their XKB state. No global/per-device config changes, runtime compositor Lua,
+uinput permissions, or pointer backend changes are required.
+
+One connection is kept for each chord/sequence and for explicit
+`keyDown()`/`keyUp()` holds. Independent operations reread the seat map; use
+`with Keyboard() as kb:` or `close()` to balance holds on cancellation. Hyprland
+and Sway active-group discovery is read-only. Setup/keymap errors are reported,
+never silently retried as wtype key commands.
+
+`typewrite()` uses physical keys when the whole string is representable in the
+active layout, including Shift/AltGr levels. Otherwise the original checked
+wtype Unicode text path is used **before any prefix is typed**. That fallback
+still uses wtype's private symbol codes and is not a physical-key HUD contract;
+it is never used for named keys, chords, or timed key sequences. A private seat
+map left active by another virtual keyboard is rejected rather than guessed.
+
+The offline regression bench checks actual wire keycodes and lifecycle cleanup;
+on Linux it also checks real libxkbcommon US/French maps and lock-state handling:
+
+```sh
+python -m unittest discover -s tests -v
+```
+
+Live verification should compare Print, q, a, F13, left/right modifiers and an
+overlapping chord in the HUD and a dedicated key-event viewer, then check the
+configured screenshot shortcut. Do not reload the compositor or add observers
+for this check.
 
 ### Cursor Tracking
 

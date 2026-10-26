@@ -1,62 +1,192 @@
 import json
 import socket
 import struct
-import subprocess
 import unittest
 from unittest.mock import Mock, patch
 
 from wayland_automation import Keyboard
 from wayland_automation.mouse_controller import (
-    Mouse, WaylandConnectionError, WaylandProtocolError,
+    Mouse,
+    WaylandConnectionError,
+    WaylandProtocolError,
 )
 from wayland_automation.utils.screen_resolution import get_geometry, get_resolution
 
 
+class FakeKeyboard:
+    def __init__(self):
+        self.held = {}
+        self.events = []
+        self.keymap = Mock()
+        self.keymap.resolve.side_effect = lambda name: (
+            {
+                "Print": 99,
+                "a": 30,
+                "q": 16,
+                "Control_L": 29,
+                "Shift_L": 42,
+                "Super_L": 125,
+                "Return": 28,
+            }.get(name, 40),
+            (),
+        )
+        self.keymap.character.side_effect = lambda char: (
+            None if ord(char) > 127 else (ord(char), ())
+        )
+
+    def down(self, name, plan=None):
+        if name not in self.held:
+            self.held[name] = plan or self.keymap.resolve(name)
+            self.events.append((name, 1))
+
+    def up(self, name):
+        if name in self.held:
+            del self.held[name]
+            self.events.append((name, 0))
+
+    def close(self):
+        for name in reversed(list(self.held)):
+            self.up(name)
+
+
 class KeyboardTests(unittest.TestCase):
+    def setUp(self):
+        self.native = FakeKeyboard()
+        self.factory = patch(
+            "wayland_automation.keyboard_controller.VirtualKeyboard",
+            return_value=self.native,
+        )
+        self.create = self.factory.start()
+        self.addCleanup(self.factory.stop)
+        self.sleep = patch("wayland_automation.keyboard_controller.time.sleep")
+        self.sleep.start()
+        self.addCleanup(self.sleep.stop)
+
     @patch("wayland_automation.keyboard_controller.subprocess.run")
-    def test_text_is_one_checked_process(self, run):
+    def test_named_keys_never_use_wtype_private_codes(self, run):
+        for name in ("Print", "a", "q", "F13", "Escape"):
+            Keyboard().press(name)
+        run.assert_not_called()
+        self.assertEqual(
+            self.native.events[:6],
+            [("Print", 1), ("Print", 0), ("a", 1), ("a", 0), ("q", 1), ("q", 0)],
+        )
+
+    @patch("wayland_automation.keyboard_controller.subprocess.run")
+    def test_layout_text_uses_physical_keys(self, run):
+        Keyboard().typewrite("hello")
+        run.assert_not_called()
+        self.assertEqual(len(self.native.events), 10)
+
+    @patch("wayland_automation.keyboard_controller.subprocess.run")
+    def test_unicode_fallback_has_no_partially_typed_prefix(self, run):
         Keyboard().typewrite("-- text λ", 0.02)
-        self.assertEqual(run.call_args.args[0],
-                         ["wtype", "-d", "20", "-"])
+        self.assertEqual(self.native.events, [])
+        self.assertEqual(run.call_args.args[0], ["wtype", "-d", "20", "-"])
         self.assertTrue(run.call_args.kwargs["check"])
         self.assertEqual(run.call_args.kwargs["input"], "-- text λ")
-
-    @patch("wayland_automation.keyboard_controller.subprocess.run")
-    def test_zero_delay_and_super_alias(self, run):
-        Keyboard().typewrite("hello")
+        Keyboard().typewrite("🐢")
         self.assertEqual(run.call_args.args[0], ["wtype", "-"])
-        Keyboard().hotkey("super", "altgr", "e")
-        self.assertEqual(run.call_args.args[0], ["wtype", "-M", "logo",
-                         "-M", "altgr", "-k", "e", "-m", "altgr", "-m", "logo"])
+
+    def test_real_modifier_edges_and_timed_sequence(self):
+        Keyboard().sequence([(0, "down", "ctrl"), (0, "down", "a"), (125, "up", "a")])
+        self.assertEqual(
+            self.native.events, [("Control_L", 1), ("a", 1), ("a", 0), ("Control_L", 0)]
+        )
+        self.assertFalse(self.native.held)
+        self.create.assert_called_once()
+
+    def test_holds_survive_between_calls_and_release_on_close(self):
+        keyboard = Keyboard()
+        keyboard.keyDown("ctrl")
+        keyboard.press("a")
+        self.assertEqual(list(self.native.held), ["Control_L"])
+        self.create.assert_called_once()
+        keyboard.close()
+        self.assertFalse(self.native.held)
+
+    def test_hotkey_keeps_preexisting_holds_and_aliases(self):
+        keyboard = Keyboard()
+        keyboard.keyDown("super")
+        keyboard.hotkey("ctrl", "enter")
+        self.assertEqual(list(self.native.held), ["Super_L"])
+        self.assertEqual(
+            self.native.events,
+            [
+                ("Super_L", 1),
+                ("Control_L", 1),
+                ("Return", 1),
+                ("Return", 0),
+                ("Control_L", 0),
+            ],
+        )
+        keyboard.keyUp("logo")
+        self.assertFalse(self.native.held)
+
+    def test_failure_releases_owned_sequence_keys(self):
+        original = self.native.down
+
+        def fail(name):
+            original(name)
+            if name == "q":
+                raise RuntimeError("connection failed")
+
+        self.native.down = fail
+        with self.assertRaises(RuntimeError):
+            Keyboard().sequence([(0, "down", "ctrl"), (1, "down", "q")])
+        self.assertFalse(self.native.held)
+        self.assertEqual(self.native.events[-2:], [("q", 0), ("Control_L", 0)])
+
+    def test_cancellation_releases_existing_and_new_holds(self):
+        keyboard = Keyboard()
+        keyboard.keyDown("ctrl")
+        original = self.native.down
+
+        def cancel(name):
+            original(name)
+            raise KeyboardInterrupt()
+
+        self.native.down = cancel
+        with self.assertRaises(KeyboardInterrupt):
+            keyboard.press("q")
+        self.assertFalse(self.native.held)
+        self.assertEqual(self.native.events[-2:], [("q", 0), ("Control_L", 0)])
 
     @patch("wayland_automation.keyboard_controller.subprocess.run")
-    def test_enter_is_named_key_not_duplicate_newline(self, run):
-        Keyboard().press("enter")
-        self.assertEqual(run.call_args.args[0], ["wtype", "-k", "Return"])
-        self.assertEqual(run.call_count, 1)
+    def test_protocol_errors_never_fallback_to_wtype(self, run):
+        self.create.side_effect = RuntimeError("missing virtual keyboard")
+        with self.assertRaises(RuntimeError):
+            Keyboard().press("Print")
+        run.assert_not_called()
 
-    @patch("wayland_automation.keyboard_controller.subprocess.run")
-    def test_chord_keeps_same_keyboard(self, run):
-        Keyboard().sequence([(0, "down", "ctrl"), (0, "down", "c"),
-                             (125, "up", "c")])
-        self.assertEqual(run.call_args.args[0], ["wtype", "-M", "ctrl",
-                         "-P", "c", "-s", "125", "-p", "c", "-m", "ctrl"])
+    def test_unavailable_key_is_rejected_before_input(self):
+        self.native.keymap.resolve.side_effect = ValueError("Unavailable")
+        with self.assertRaises(ValueError):
+            Keyboard().sequence([(0, "down", "ctrl"), (1, "down", "nonsense")])
+        self.assertEqual(self.native.events, [])
 
-    @patch("wayland_automation.keyboard_controller.subprocess.run")
-    def test_hotkey_alias_and_failure(self, run):
-        run.side_effect = subprocess.CalledProcessError(1, "wtype")
-        with self.assertRaises(subprocess.CalledProcessError):
-            Keyboard().hotkey("ctrl", "enter")
-        self.assertEqual(run.call_args.args[0],
-                         ["wtype", "-M", "ctrl", "-k", "Return", "-m", "ctrl"])
-
-    def test_invalid_events_rejected_before_input(self):
-        for events in [[(-1, "down", "a")], [(0, "bad", "a")],
-                       [(20, "down", "a"), (10, "up", "a")]]:
+    def test_invalid_events_rejected_before_connection(self):
+        for events in [
+            [(-1, "down", "a")],
+            [(0, "bad", "a")],
+            [(20, "down", "a"), (10, "up", "a")],
+            [(True, "down", "a")],
+        ]:
             with self.assertRaises(ValueError):
                 Keyboard().sequence(events)
-        with self.assertRaises(ValueError):
-            Keyboard().typewrite("test", float("nan"))
+        for interval in (float("nan"), -1):
+            with self.assertRaises(ValueError):
+                Keyboard().typewrite("test", interval)
+        self.create.assert_not_called()
+
+    def test_empty_operations_and_unmatched_release_do_not_connect(self):
+        keyboard = Keyboard()
+        keyboard.sequence([])
+        keyboard.hotkey()
+        keyboard.typewrite("")
+        keyboard.keyUp("ctrl")
+        keyboard.close()
+        self.create.assert_not_called()
 
 
 class PointerTests(unittest.TestCase):
@@ -108,11 +238,14 @@ class PointerTests(unittest.TestCase):
         mouse.scroll(vertical=-2, horizontal=1)
         calls = mouse.send_message.call_args_list
         self.assertEqual([call.args[1] for call in calls], [5, 7, 7, 4])
-        self.assertEqual(struct.unpack("<IIii", calls[1].args[2])[1:],
-                         (0, -2 * 15 * 256, -2))
+        self.assertEqual(
+            struct.unpack("<IIii", calls[1].args[2])[1:], (0, -2 * 15 * 256, -2)
+        )
 
-    @patch("wayland_automation.mouse_controller.get_geometry",
-           return_value=(-1920, 0, 3840, 1080))
+    @patch(
+        "wayland_automation.mouse_controller.get_geometry",
+        return_value=(-1920, 0, 3840, 1080),
+    )
     def test_negative_desktop_origin_and_middle_button(self, geometry):
         mouse = self.mouse()
         mouse.send_motion_absolute = Mock()
@@ -140,18 +273,31 @@ class PointerTests(unittest.TestCase):
         self.assertEqual(struct.unpack("<III", calls[2].args[2])[1:], (0x112, 0))
 
     @patch.dict("os.environ", {"WAYLAND_DISPLAY": "/custom/wayland"})
-    def test_absolute_wayland_socket(self):
+    @patch("wayland_automation.mouse_controller.os.path.isabs", return_value=True)
+    def test_absolute_wayland_socket(self, isabs):
         self.assertEqual(self.mouse().get_socket_path(), "/custom/wayland")
 
 
 class GeometryTests(unittest.TestCase):
-    @patch("wayland_automation.utils.screen_resolution.shutil.which", return_value="hyprctl")
+    @patch(
+        "wayland_automation.utils.screen_resolution.shutil.which",
+        return_value="hyprctl",
+    )
     @patch("wayland_automation.utils.screen_resolution.subprocess.run")
     def test_scaled_rotated_monitors(self, run, which):
-        run.return_value.stdout = json.dumps([
-            {"x": -1080, "y": 0, "width": 1920, "height": 1080, "transform": 1, "scale": 1},
-            {"x": 0, "y": 0, "width": 3840, "height": 2160, "scale": 2},
-        ])
+        run.return_value.stdout = json.dumps(
+            [
+                {
+                    "x": -1080,
+                    "y": 0,
+                    "width": 1920,
+                    "height": 1080,
+                    "transform": 1,
+                    "scale": 1,
+                },
+                {"x": 0, "y": 0, "width": 3840, "height": 2160, "scale": 2},
+            ]
+        )
         self.assertEqual(get_geometry(), (-1080, 0, 3000, 1920))
 
     @patch("wayland_automation.utils.screen_resolution.subprocess.run")

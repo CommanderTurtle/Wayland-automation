@@ -1,53 +1,44 @@
-"""
-keyboard_controller.py — Keyboard automation for Wayland via ``wtype``.
+"""Physical-key automation via the Wayland seat's XKB map.
 
-Provides the ``Keyboard`` class for typing text, pressing keys, and
-triggering hotkey combinations on any Wayland compositor that supports wtype.
-
-Usage::
-
-    from wayland_automation import Keyboard
-
-    kb = Keyboard()
-    kb.typewrite("Hello Wayland!", interval=0.05)
-    kb.press("enter")
-    kb.hotkey("ctrl", "s")
-
-Requires ``wtype`` to be installed (see README for install instructions).
+Named keys, chords and timed sequences retain evdev identity. wtype remains
+the Unicode text fallback when a character has no key in the active layout.
 """
 
+from contextlib import contextmanager
+import math
 import subprocess
 import time
-import math
+
+from .utils.virtual_keyboard import VirtualKeyboard
+
 
 class Keyboard:
-    """
-    A simple keyboard automation module for Wayland using `wtype`.
-
-    Methods:
-    - typewrite(text, interval=0): Types text with an optional delay between characters.
-    - press(key): Presses and releases a key.
-    - keyDown(key): Simulates pressing a key down.
-    - keyUp(key): Simulates releasing a key.
-    - hotkey(*keys): Simulates a key combination (e.g., hotkey('ctrl', 's')).
-    """
-
     def __init__(self):
-        # Mapping common modifier names to what wtype expects.
+        self._native = None
         self.modifier_map = {
-            "ctrl": "ctrl",
-            "control": "ctrl",
-            "alt": "alt",
-            "shift": "shift",
-            "super": "logo", "win": "logo", "logo": "logo",
-            "altgr": "altgr", "iso_level3_shift": "altgr"
+            "ctrl": "Control_L",
+            "control": "Control_L",
+            "alt": "Alt_L",
+            "shift": "Shift_L",
+            "super": "Super_L",
+            "win": "Super_L",
+            "logo": "Super_L",
+            "altgr": "ISO_Level3_Shift",
+            "iso_level3_shift": "ISO_Level3_Shift",
         }
-        # A mapping for some common keys to their special characters.
         self.key_map = {
-            "enter": "Return", "return": "Return",
-            "backspace": "BackSpace", "tab": "Tab", "space": "space",
-            "esc": "Escape", "escape": "Escape", "delete": "Delete",
-            "left": "Left", "right": "Right", "up": "Up", "down": "Down"
+            "enter": "Return",
+            "return": "Return",
+            "backspace": "BackSpace",
+            "tab": "Tab",
+            "space": "space",
+            "esc": "Escape",
+            "escape": "Escape",
+            "delete": "Delete",
+            "left": "Left",
+            "right": "Right",
+            "up": "Up",
+            "down": "Down",
         }
 
     def _key(self, key):
@@ -56,103 +47,162 @@ class Keyboard:
             raise ValueError("A key name must be nonempty and contain no NUL")
         return self.modifier_map.get(key.lower(), self.key_map.get(key.lower(), key))
 
-    def _run(self, args, timeout=30, input=None):
-        result = subprocess.run(["wtype", *args], capture_output=True,
-                                text=True, timeout=timeout, check=True, input=input)
-        return result
+    def _backend(self):
+        if self._native is None:
+            self._native = VirtualKeyboard()
+        return self._native
+
+    def _finish(self):
+        # Snapshot the current seat/layout again for the next independent
+        # operation, but keep one keyboard throughout an explicit held chord.
+        if self._native is not None and not self._native.held:
+            self.close()
+
+    @contextmanager
+    def _operation(self):
+        native = self._backend()
+        existing = set(native.held)
+        try:
+            yield native
+            for name in reversed(list(native.held)):
+                if name not in existing:
+                    native.up(name)
+        except BaseException:
+            self.close()
+            raise
+        finally:
+            self._finish()
+
+    def close(self):
+        """Release this object's held keys and close only its own connection."""
+        native, self._native = self._native, None
+        if native is not None:
+            native.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def typewrite(self, text: str, interval: float = 0):
-        """Types the given text with an optional interval between characters."""
+        """Type through physical keys where possible; preserve Unicode fallback."""
         if not math.isfinite(interval) or interval < 0:
             raise ValueError("interval must be finite and nonnegative")
-        if text:
-            delay = round(interval * 1000)
-            args = (["-d", str(delay)] if delay else []) + ["-"]
-            self._run(args, timeout=max(30, len(text) * interval + 10), input=text)
+        if not isinstance(text, str) or "\x00" in text:
+            raise ValueError("Text must be a string without NUL")
+        if not text:
+            return
+        with self._operation() as native:
+            # Plan before sending anything, so fallback cannot duplicate a
+            # partially typed prefix. Never fallback for connection/keymap errors.
+            plans = [native.keymap.character(char) for char in text]
+            if any(plan is None for plan in plans):
+                if native.held:
+                    raise ValueError(
+                        "Unicode text fallback cannot run while keys are held"
+                    )
+                self.close()  # wtype must not inherit our temporary seat map.
+                delay = round(interval * 1000)
+                subprocess.run(
+                    ["wtype", *(["-d", str(delay)] if delay else []), "-"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=max(30, len(text) * interval + 10),
+                    input=text,
+                )
+                return
+            begin = time.monotonic()
+            for index, plan in enumerate(plans):
+                time.sleep(max(0, begin + index * interval - time.monotonic()))
+                native.down("__text__", plan)
+                native.up("__text__")
 
     def press(self, key: str):
-        """Presses and releases a single key."""
-        self._run(["-k", self._key(key)])
+        """Press and release a key without releasing a caller-owned hold."""
+        name = self._key(key)
+        with self._operation() as native:
+            native.down(name)
 
     def keyDown(self, key: str):
-        """Press a key in one wtype invocation.
-
-        wtype releases keys when its process exits. For holds spanning several
-        events use sequence(), rather than separate keyDown()/keyUp() calls.
-        """
-        flag = "-M" if key.lower() in self.modifier_map else "-P"
-        self._run([flag, self._key(key)])
+        """Hold a key on this Keyboard until keyUp() or close()."""
+        name = self._key(key)
+        try:
+            self._backend().down(name)
+        except BaseException:
+            self.close()
+            raise
 
     def keyUp(self, key: str):
-        """Simulates releasing a held key."""
-        flag = "-m" if key.lower() in self.modifier_map else "-p"
-        self._run([flag, self._key(key)])
+        """Release a key held by this Keyboard; unmatched releases are no-ops."""
+        name = self._key(key)
+        if self._native is not None:
+            try:
+                self._native.up(name)
+            except BaseException:
+                self.close()
+                raise
+            finally:
+                self._finish()
 
     def sequence(self, events):
-        """Run (absolute milliseconds, 'down'|'up', key) events in one keyboard.
-
-        Times must be nonnegative and ordered. Any keys still held at the end
-        are released. Errors from wtype propagate instead of looking successful.
-        """
-        args, held, previous = [], [], 0
+        """Execute ordered absolute-millisecond down/up events on one keyboard."""
+        planned, previous = [], 0
         for timestamp, state, key in events:
-            if (not isinstance(timestamp, int) or timestamp < previous
-                    or state not in ("down", "up")):
+            if (
+                type(timestamp) is not int
+                or timestamp < previous
+                or state not in ("down", "up")
+            ):
                 raise ValueError("Events need ordered integer times and down/up states")
-            if timestamp > previous:
-                args.extend(["-s", str(timestamp - previous)])
             previous = timestamp
-            name = self._key(key)
-            modifier = str(key).lower() in self.modifier_map
-            args.extend([("-M" if modifier else "-P") if state == "down"
-                         else ("-m" if modifier else "-p"), name])
-            entry = (name, modifier)
-            if state == "down" and entry not in held:
-                held.append(entry)
-            elif state == "up" and entry in held:
-                held.remove(entry)
-        for name, modifier in reversed(held):
-            args.extend(["-m" if modifier else "-p", name])
-        if args:
-            self._run(args, timeout=max(30, previous / 1000 + 10))
+            planned.append((timestamp, state, self._key(key)))
+        if not planned:
+            return
+        with self._operation() as native:
+            # Reject an unavailable key before injecting any part of the macro.
+            for _, _, name in planned:
+                native.keymap.resolve(name)
+            begin = time.monotonic()
+            for timestamp, state, name in planned:
+                time.sleep(max(0, begin + timestamp / 1000 - time.monotonic()))
+                (native.down if state == "down" else native.up)(name)
 
     def hotkey(self, *keys):
-        """
-        Simulates a key combination by constructing a single wtype command that:
-          - Presses all modifier keys down
-          - Presses non-modifier key(s)
-          - Releases the modifier keys in reverse order.
-        Example:
-            hotkey('ctrl', 'b') will simulate Ctrl+B.
-        """
-        modifiers = []
-        non_modifiers = []
-
-        for key in keys:
-            if key.lower() in self.modifier_map:
-                modifiers.append(self.modifier_map[key.lower()])
-            else:
-                non_modifiers.append(self._key(key))
-
-        # Build the command list in one go.
-        cmd = ["wtype"]
-        # Press modifiers down
-        for mod in modifiers:
-            cmd.extend(["-M", mod])
-        # Press non-modifiers
-        for key in non_modifiers:
-            cmd.extend(["-k", key])
-        # Release modifiers (in reverse order)
-        for mod in reversed(modifiers):
-            cmd.extend(["-m", mod])
-
-        if keys:
-            self._run(cmd[1:])
-
-# Example Usage
-if __name__ == "__main__":
-    kb = Keyboard()
-    time.sleep(2)  # Gives time to switch to another window
-    kb.typewrite("Hello, Wayland!", interval=0.05)
-    kb.press("enter")
-    kb.hotkey("ctrl", "a")
+        """Hold modifiers, tap ordinary keys, then release owned modifiers."""
+        names = [self._key(key) for key in keys]
+        if not names:
+            return
+        modifiers = {
+            "Control_L",
+            "Control_R",
+            "Shift_L",
+            "Shift_R",
+            "Alt_L",
+            "Alt_R",
+            "Super_L",
+            "Super_R",
+            "Meta_L",
+            "Meta_R",
+            "ISO_Level3_Shift",
+            "ISO_Level5_Shift",
+        }
+        with self._operation() as native:
+            existing = set(native.held)
+            for name in names:
+                native.keymap.resolve(name)
+            for name in names:
+                if name in modifiers:
+                    native.down(name)
+            for name in names:
+                if name not in modifiers:
+                    native.down(name)
+                    if name not in existing:
+                        native.up(name)
