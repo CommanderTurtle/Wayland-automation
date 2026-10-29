@@ -34,7 +34,6 @@ from wayland_automation.utils.screen_resolution import get_geometry
 # Configure logging
 import logging
 
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
 # Define button constants
@@ -61,6 +60,8 @@ def encode_wayland_string(s: str) -> bytes:
 
 class Mouse:
     def __init__(self):
+        self.sock = None
+        self.current_virtual_pointer_id = None
         try:
             self.socket_path = self.get_socket_path()
             self.sock = self.connect_to_wayland()
@@ -101,7 +102,9 @@ class Mouse:
         wayland_display = os.getenv("WAYLAND_DISPLAY", "wayland-0")
         if os.path.isabs(wayland_display):
             return wayland_display
-        runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+        runtime = os.environ.get("XDG_RUNTIME_DIR")
+        if not runtime:
+            runtime = f"/run/user/{os.getuid()}"
         return os.path.join(runtime, wayland_display)
 
     def connect_to_wayland(self):
@@ -264,28 +267,31 @@ class Mouse:
                                       code, int(bool(pressed))))
         self.send_message(self.current_virtual_pointer_id, 4, b"")
 
+    @staticmethod
+    def _parse_button(button):
+        """Resolve named buttons while retaining None as a move-only request."""
+        if button is None:
+            return None
+        if isinstance(button, str):
+            names = {"left": BUTTON_LEFT, "l": BUTTON_LEFT,
+                     "right": BUTTON_RIGHT, "r": BUTTON_RIGHT,
+                     "middle": BUTTON_MIDDLE, "m": BUTTON_MIDDLE,
+                     "nothing": None, "none": None, "move": None}
+            name = button.strip().lower()
+            if name not in names:
+                raise ValueError("Use left, middle, right, or nothing")
+            return names[name]
+        return int(button)
+
     def click(self, x, y, button=None):
         """
         Moves the pointer to (x, y) and, if button is specified, performs a click.
         """
+        button_code = self._parse_button(button)
         origin_x, origin_y, width, height = get_geometry()
         self.send_motion_absolute(x - origin_x, y - origin_y, width, height)
         
-        if button is not None:
-            if isinstance(button, str):
-                btn = button.lower()
-                if btn == "left":
-                    button_code = BUTTON_LEFT
-                elif btn == "right":
-                    button_code = BUTTON_RIGHT
-                elif btn == "middle":
-                    button_code = BUTTON_MIDDLE
-                elif btn == "nothing":
-                    return
-                else:
-                    raise ValueError("Use left, middle, right, or nothing")
-            else:
-                button_code = int(button)
+        if button_code is not None:
             self.send_click(button_code)
 
         self.send_sync_request()
@@ -359,9 +365,9 @@ class Mouse:
 
     def close(self):
         """Release this virtual input device and its socket. Safe to call twice."""
-        if self.sock is not None:
+        if getattr(self, "sock", None) is not None:
             try:
-                if self.current_virtual_pointer_id is not None:
+                if getattr(self, "current_virtual_pointer_id", None) is not None:
                     self.send_message(self.current_virtual_pointer_id, 8, b"")
             except WaylandConnectionError:
                 pass  # A disconnected compositor already released the device.
@@ -369,6 +375,17 @@ class Mouse:
                 self.sock.close()
                 self.sock = None
                 self.current_virtual_pointer_id = None
+
+    def is_connected(self):
+        """Report whether this pointer owns an open socket."""
+        sock = getattr(self, "sock", None)
+        return sock is not None and sock.fileno() != -1
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def __enter__(self):
         return self
@@ -385,18 +402,9 @@ class Mouse:
         print(f"Waiting {initial_delay} seconds before starting auto-click...")
         time.sleep(initial_delay)
         start_time = time.time()
-        # Determine the button code from the parameter
-        if isinstance(button, str):
-            btn = button.lower()
-            if btn == "left":
-                button_code = BUTTON_LEFT
-            elif btn == "right":
-                button_code = BUTTON_RIGHT
-            else:
-                print("Invalid button string. Use 'left' or 'right'. Defaulting to left.")
-                button_code = BUTTON_LEFT
-        else:
-            button_code = int(button)
+        button_code = self._parse_button(button)
+        if button_code is None:
+            button_code = BUTTON_LEFT
 
         while time.time() - start_time < duration:
             self.send_click(button_code)

@@ -230,6 +230,36 @@ class PointerTests(unittest.TestCase):
         mouse.send_sync_request()
         self.assertNotEqual(first, mouse.callback_id)
 
+    @patch.object(Mouse, "get_socket_path", return_value="/fixture/wayland")
+    @patch.object(Mouse, "connect_to_wayland")
+    def test_initial_pointer_object_ids_remain_sequential(self, connect, path):
+        from wayland_automation.mouse_controller import encode_wayland_string
+        payload = struct.pack("<I", 10) + encode_wayland_string("zwlr_virtual_pointer_manager_v1") + struct.pack("<I", 2)
+        registry = struct.pack("<IHH", 2, 0, 8 + len(payload)) + payload
+        done = struct.pack("<IHHI", 3, 0, 12, 0)
+        sock = connect.return_value
+        sock.recv.side_effect = [registry[:8], registry[8:], done[:8], done[8:]]
+        with Mouse() as mouse:
+            sent = [call.args[0] for call in sock.sendall.call_args_list]
+            self.assertEqual(struct.unpack("<I", sent[0][-4:])[0], 2)
+            self.assertEqual(struct.unpack("<I", sent[1][-4:])[0], 3)
+            self.assertEqual(struct.unpack("<I", sent[2][-4:])[0], 4)
+            self.assertEqual(struct.unpack("<I", sent[3][-4:])[0], 5)
+            mouse.send_sync_request()
+            self.assertEqual(mouse.callback_id, 6)
+
+    @patch("wayland_automation.mouse_controller.get_geometry", return_value=(0, 0, 1920, 1080))
+    def test_move_only_requests_never_emit_a_click(self, geometry):
+        mouse = self.mouse()
+        mouse.send_motion_absolute = Mock()
+        mouse.send_click = Mock()
+        mouse.send_sync_request = Mock()
+        mouse.handle_events = Mock()
+        for button in (None, "nothing", "none", "move"):
+            mouse.click(100, 200, button)
+        mouse.send_click.assert_not_called()
+        self.assertEqual(mouse.send_motion_absolute.call_count, 4)
+
     def test_scroll_opcodes_and_fixed_values(self):
         mouse = self.mouse()
         mouse.send_message = Mock()

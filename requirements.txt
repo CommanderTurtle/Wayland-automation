@@ -1,1 +1,2 @@
-evdev
+# Python runtime dependencies use the standard library.
+# Optional cursor backends: pip install '.[evdev]' or '.[kde]'.

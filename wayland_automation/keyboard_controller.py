@@ -6,40 +6,77 @@ the Unicode text fallback when a character has no key in the active layout.
 
 from contextlib import contextmanager
 import math
+import shutil
 import subprocess
 import time
 
-from .utils.virtual_keyboard import VirtualKeyboard
+from .utils.virtual_keyboard import KeyboardError, VirtualKeyboard
 
 
 class Keyboard:
-    def __init__(self):
+    MODIFIER_MAP = {
+        "ctrl": "Control_L",
+        "control": "Control_L",
+        "alt": "Alt_L",
+        "shift": "Shift_L",
+        "super": "Super_L",
+        "win": "Super_L",
+        "windows": "Super_L",
+        "meta": "Super_L",
+        "logo": "Super_L",
+        "altgr": "ISO_Level3_Shift",
+        "iso_level3_shift": "ISO_Level3_Shift",
+    }
+    KEY_MAP = {
+        "enter": "Return",
+        "return": "Return",
+        "backspace": "BackSpace",
+        "tab": "Tab",
+        "space": "space",
+        "esc": "Escape",
+        "escape": "Escape",
+        "delete": "Delete",
+        "left": "Left",
+        "right": "Right",
+        "up": "Up",
+        "down": "Down",
+        "\n": "Return",
+        "\b": "BackSpace",
+        "\t": "Tab",
+        " ": "space",
+        "home": "Home",
+        "end": "End",
+        "pageup": "Page_Up",
+        "page_up": "Page_Up",
+        "pagedown": "Page_Down",
+        "page_down": "Page_Down",
+        "del": "Delete",
+        "insert": "Insert",
+        "caps_lock": "Caps_Lock",
+        "capslock": "Caps_Lock",
+        "num_lock": "Num_Lock",
+        "numlock": "Num_Lock",
+        **{"f" + str(number): "F" + str(number) for number in range(1, 36)},
+    }
+
+    def __init__(self, verify_wtype=False):
         self._native = None
-        self.modifier_map = {
-            "ctrl": "Control_L",
-            "control": "Control_L",
-            "alt": "Alt_L",
-            "shift": "Shift_L",
-            "super": "Super_L",
-            "win": "Super_L",
-            "logo": "Super_L",
-            "altgr": "ISO_Level3_Shift",
-            "iso_level3_shift": "ISO_Level3_Shift",
-        }
-        self.key_map = {
-            "enter": "Return",
-            "return": "Return",
-            "backspace": "BackSpace",
-            "tab": "Tab",
-            "space": "space",
-            "esc": "Escape",
-            "escape": "Escape",
-            "delete": "Delete",
-            "left": "Left",
-            "right": "Right",
-            "up": "Up",
-            "down": "Down",
-        }
+        self.modifier_map = self.MODIFIER_MAP.copy()
+        self.key_map = self.KEY_MAP.copy()
+        if verify_wtype:
+            self._ensure_wtype()
+
+    @staticmethod
+    def is_available():
+        """Report availability of the optional wtype Unicode fallback."""
+        return shutil.which("wtype") is not None
+
+    def _ensure_wtype(self):
+        if not self.is_available():
+            raise KeyboardError(
+                "Unicode text fallback requires wtype: sudo pacman -S wtype (Arch), "
+                "sudo apt install wtype (Debian/Ubuntu), or sudo dnf install wtype (Fedora)"
+            )
 
     def _key(self, key):
         key = str(key)
@@ -110,14 +147,20 @@ class Keyboard:
                     )
                 self.close()  # wtype must not inherit our temporary seat map.
                 delay = round(interval * 1000)
-                subprocess.run(
-                    ["wtype", *(["-d", str(delay)] if delay else []), "-"],
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                    timeout=max(30, len(text) * interval + 10),
-                    input=text,
-                )
+                try:
+                    subprocess.run(
+                        ["wtype", *(["-d", str(delay)] if delay else []), "-"],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                        timeout=max(30, len(text) * interval + 10),
+                        input=text,
+                    )
+                except FileNotFoundError as error:
+                    raise KeyboardError(
+                        "Unicode text fallback requires wtype: sudo pacman -S wtype (Arch), "
+                        "sudo apt install wtype (Debian/Ubuntu), or sudo dnf install wtype (Fedora)"
+                    ) from error
                 return
             begin = time.monotonic()
             for index, plan in enumerate(plans):
