@@ -1,3 +1,26 @@
+## personal fork of OTAKUWeBer's wayland-automation
+
+> "Move the cursor without the typical, manditory *click*!"
+
+| area | what this fork does |
+|---|---|
+| cursor movement | `click(x, y)` moves the cursor, and clicking is just a matter of passing a button along with it. Left, right and middle buttons all support press/release holds, so multi-segment drags work too |
+| physical keyboard | named keys go through the seat's XKB map with physical keycodes, and modifiers keep their left/right identity. Print, letters and function keys fire compositor shortcuts and key displays properly, and Unicode text goes through wtype for characters the layout doesn't have |
+| timed input | `Keyboard.sequence()` fires key events in order, at millisecond granularity, on a single connection. Chords keep their held keys between calls, and closing or cancelling releases the keyboard's keys and connection |
+| pointer lifecycle | top-level calls release their virtual pointer once the operation is done. Sequential object IDs, full socket reads and bounded waits keep pointer requests in step with the Wayland protocol |
+| desktop geometry | desktop bounds account for monitor origins, scaling and rotation, including negative coordinates and multi-screen setups. Hyprland and Sway report their logical geometry directly |
+| cursor backends | Hyprland, wl-find-cursor, XWayland, plus optional KDE/evdev tracking. The CLI can also take position snapshots and check dependencies, and the optional packages come in via the `kde` and `evdev` extras |
+
+```bash
+pip install "git+https://github.com/CommanderTurtle/Wayland-automation.git"
+```
+
+### [OTAKUWeBer/Wayland-automation](https://github.com/OTAKUWeBer/Wayland-automation) - visit for the upstream repo!
+
+Upstream notes (helpful to agents):
+
+<details><summary>click to expand</summary>
+
 # Wayland Automation
 
 [![PyPI version](https://img.shields.io/pypi/v/wayland-automation.svg)](https://pypi.org/project/wayland-automation/)
@@ -270,6 +293,4 @@ button on the same pointer, allowing multi-segment drags. The optional evdev
 tracking fallback is available through `pip install 'wayland-automation[evdev]'`;
 Hyprland tracking does not require input-group access.
 
-## License
-
-[MIT License](LICENCE)
+</details>
